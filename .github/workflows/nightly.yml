@@ -128,22 +128,25 @@ jobs:
               "git clone https://x-access-token:${{ secrets.GH_PAT }}@github.com/${{ secrets.SOURCE_REPO }} ~/app"
 
       - name: Write .env file and copy to instance
+        env:
+          DB_HOST: ${{ secrets.DB_HOST }}
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          DB_NAME: ${{ secrets.DB_NAME }}
+          INSTANCE_IP: ${{ steps.ec2-ip.outputs.ip }}
         run: |
-          # REACT_APP_API_URL uses /api since nginx on the same host
-          # proxies /api/ → backend:8080. The smoke test targets http://localhost
-          # which hits nginx on port 80, matching production behaviour.
-          cat > /tmp/app.env << EOF
-          DB_HOST=${{ secrets.DB_HOST }}
-          DB_USER=${{ secrets.DB_USER }}
-          DB_PASSWORD=${{ secrets.DB_PASSWORD }}
-          DB_NAME=${{ secrets.DB_NAME }}
-          NODE_ENV=production
-          REACT_APP_API_URL=http://${{ steps.ec2-ip.outputs.ip }}/api
-          EOF
+          {
+            echo "DB_HOST=$DB_HOST"
+            echo "DB_USER=$DB_USER"
+            echo "DB_PASSWORD=$DB_PASSWORD"
+            echo "DB_NAME=$DB_NAME"
+            echo "NODE_ENV=production"
+            echo "REACT_APP_API_URL=http://${INSTANCE_IP}/api"
+          } > /tmp/app.env
 
           scp -o StrictHostKeyChecking=no -i /tmp/ssh_key \
               /tmp/app.env \
-              ec2-user@"${{ steps.ec2-ip.outputs.ip }}":~/app/.env
+              ec2-user@"${INSTANCE_IP}":~/app/.env
 
       - name: Build and start application
         # Building the React image takes a few minutes on t3.small — 10 min timeout
