@@ -214,10 +214,10 @@ jobs:
           ECR_REPO: ${{ secrets.ECR_REPO }}
           QA_EC2_HOST: ${{ secrets.QA_EC2_HOST }}
         run: |
-          TAG="nightly-$(date +%Y%m%d)"
+          DATE="$(date +%Y%m%d)"
           ECR="${AWS_ACCOUNT_ID}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com"
-          BACKEND_URI="${ECR}/${ECR_REPO}-backend:${TAG}"
-          FRONTEND_URI="${ECR}/${ECR_REPO}-frontend:${TAG}"
+          BACKEND_URI="${ECR}/${ECR_REPO}:backend-${DATE}"
+          FRONTEND_URI="${ECR}/${ECR_REPO}:frontend-${DATE}"
 
           # Backend (no build args needed)
           docker build --target backend -t "${BACKEND_URI}" /tmp/app-source
