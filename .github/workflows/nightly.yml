@@ -192,7 +192,124 @@ jobs:
               "bash ~/app/smoke-test.sh http://localhost"
 
       # ---------------------------------------------------------------
-      # Cleanup — always runs, even on failure
+      # Step 4 — Build and push images to ECR
+      # Built on the runner (which already has AWS credentials).
+      # Pushes backend and frontend as separately tagged images.
+      # ---------------------------------------------------------------
+
+      - name: Clone source repo on runner
+        run: |
+          git clone https://x-access-token:${{ secrets.GH_PAT }}@github.com/${{ secrets.SOURCE_REPO }} /tmp/app-source
+
+      - name: Log in to Amazon ECR
+        run: |
+          aws ecr get-login-password --region "${{ secrets.AWS_REGION }}" | \
+            docker login --username AWS --password-stdin \
+            "${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com"
+
+      - name: Build and push images to ECR
+        id: ecr-push
+        env:
+          AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+          ECR_REPO: ${{ secrets.ECR_REPO }}
+          QA_EC2_HOST: ${{ secrets.QA_EC2_HOST }}
+        run: |
+          TAG="nightly-$(date +%Y%m%d)"
+          ECR="${AWS_ACCOUNT_ID}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com"
+          BACKEND_URI="${ECR}/${ECR_REPO}-backend:${TAG}"
+          FRONTEND_URI="${ECR}/${ECR_REPO}-frontend:${TAG}"
+
+          # Backend (no build args needed)
+          docker build --target backend -t "${BACKEND_URI}" /tmp/app-source
+          docker push "${BACKEND_URI}"
+
+          # Frontend — bake in the QA host's API URL
+          docker build --target frontend \
+            --build-arg REACT_APP_API_URL="http://${QA_EC2_HOST}/api" \
+            -t "${FRONTEND_URI}" /tmp/app-source
+          docker push "${FRONTEND_URI}"
+
+          echo "backend_uri=${BACKEND_URI}" >> "$GITHUB_OUTPUT"
+          echo "frontend_uri=${FRONTEND_URI}" >> "$GITHUB_OUTPUT"
+          echo "Pushed backend:  ${BACKEND_URI}"
+          echo "Pushed frontend: ${FRONTEND_URI}"
+
+      # ---------------------------------------------------------------
+      # Step 5 — Deploy to QA EC2
+      # ---------------------------------------------------------------
+
+      - name: Write QA .env and docker-compose to QA EC2
+        env:
+          DB_HOST: ${{ secrets.DB_HOST }}
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          DB_NAME: ${{ secrets.DB_NAME }}
+          BACKEND_IMAGE: ${{ steps.ecr-push.outputs.backend_uri }}
+          FRONTEND_IMAGE: ${{ steps.ecr-push.outputs.frontend_uri }}
+          QA_HOST: ${{ secrets.QA_EC2_HOST }}
+        run: |
+          {
+            echo "DB_HOST=$DB_HOST"
+            echo "DB_USER=$DB_USER"
+            echo "DB_PASSWORD=$DB_PASSWORD"
+            echo "DB_NAME=$DB_NAME"
+            echo "NODE_ENV=production"
+            echo "BACKEND_IMAGE=$BACKEND_IMAGE"
+            echo "FRONTEND_IMAGE=$FRONTEND_IMAGE"
+          } > /tmp/qa.env
+
+          scp -o StrictHostKeyChecking=no -i /tmp/ssh_key \
+              /tmp/qa.env ec2-user@"${QA_HOST}":~/app/.env
+
+          scp -o StrictHostKeyChecking=no -i /tmp/ssh_key \
+              qa/docker-compose.yml ec2-user@"${QA_HOST}":~/app/docker-compose.yml
+
+      - name: Pull and restart on QA EC2
+        env:
+          AWS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
+          AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+          QA_HOST: ${{ secrets.QA_EC2_HOST }}
+        run: |
+          ECR="${AWS_ACCOUNT_ID}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com"
+
+          # Write a deploy script so credentials aren't embedded in SSH argv
+          {
+            echo '#!/bin/bash'
+            echo 'set -e'
+            echo "export AWS_ACCESS_KEY_ID='${AWS_KEY_ID}'"
+            echo "export AWS_SECRET_ACCESS_KEY='${AWS_SECRET}'"
+            echo "export AWS_SESSION_TOKEN='${AWS_TOKEN}'"
+            echo "aws ecr get-login-password --region '${{ secrets.AWS_REGION }}' | \\"
+            echo "  docker login --username AWS --password-stdin '${ECR}'"
+            echo 'cd ~/app'
+            echo 'docker compose pull'
+            echo 'docker compose up -d'
+            echo 'rm -- "$0"'
+          } > /tmp/qa-deploy.sh
+
+          scp -o StrictHostKeyChecking=no -i /tmp/ssh_key \
+              /tmp/qa-deploy.sh ec2-user@"${QA_HOST}":~/qa-deploy.sh
+
+          ssh -o StrictHostKeyChecking=no -i /tmp/ssh_key \
+              ec2-user@"${QA_HOST}" 'bash ~/qa-deploy.sh'
+
+      - name: QA health check
+        run: |
+          echo "Polling QA at ${{ secrets.QA_EC2_HOST }}..."
+          for i in $(seq 1 12); do
+            CODE=$(ssh -o StrictHostKeyChecking=no -i /tmp/ssh_key \
+                ec2-user@"${{ secrets.QA_EC2_HOST }}" \
+                "curl -s -o /dev/null -w '%{http_code}' http://localhost/api/getArticles" 2>/dev/null)
+            echo "  Attempt $i/12 — HTTP $CODE"
+            [ "$CODE" = "200" ] && echo "QA is healthy" && exit 0
+            sleep 10
+          done
+          echo "ERROR: QA health check failed" && exit 1
+
+      # ---------------------------------------------------------------
+      # Step 6 — Cleanup — always runs, even on failure
       # ---------------------------------------------------------------
 
       - name: Terminate temp instance
