@@ -156,6 +156,29 @@ jobs:
               ec2-user@"${{ steps.ec2-ip.outputs.ip }}" \
               "cd ~/app && docker compose up --build -d"
 
+      - name: Wait for application to be ready
+        run: |
+          echo "Waiting for http://localhost/api/getArticles to respond..."
+          for i in $(seq 1 18); do
+            CODE=$(ssh -o StrictHostKeyChecking=no -i /tmp/ssh_key \
+                ec2-user@"${{ steps.ec2-ip.outputs.ip }}" \
+                "curl -s -o /dev/null -w '%{http_code}' http://localhost/api/getArticles" 2>/dev/null)
+            echo "  Attempt $i/18 — HTTP $CODE"
+            if [ "$CODE" = "200" ]; then
+              echo "App is ready!"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "App did not become ready in time — showing logs for diagnosis"
+
+      - name: Show container logs (always)
+        if: always()
+        run: |
+          ssh -o StrictHostKeyChecking=no -i /tmp/ssh_key \
+              ec2-user@"${{ steps.ec2-ip.outputs.ip }}" \
+              "cd ~/app && echo '=== .env contents ===' && cat .env && echo '=== docker compose ps ===' && docker compose ps && echo '=== backend logs ===' && docker compose logs --tail=60 backend"
+
       # ---------------------------------------------------------------
       # Step 3 — Smoke tests
       # Runs on the instance itself via SSH so no extra ports need opening.
