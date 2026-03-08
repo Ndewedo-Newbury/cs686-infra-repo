@@ -300,6 +300,7 @@ jobs:
             echo "  docker login --username AWS --password-stdin '${ECR}'"
             echo 'cd ~/app'
             echo 'docker compose pull'
+            echo 'docker compose down --remove-orphans'
             echo 'docker compose up -d'
             echo 'rm -- "$0"'
           } > /tmp/qa-deploy.sh
