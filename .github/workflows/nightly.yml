@@ -298,6 +298,9 @@ jobs:
             echo "export AWS_SESSION_TOKEN='${AWS_TOKEN}'"
             echo "aws ecr get-login-password --region '${{ secrets.AWS_REGION }}' | \\"
             echo "  docker login --username AWS --password-stdin '${ECR}'"
+            echo '# Stop any OS-level service holding port 80'
+            echo 'sudo systemctl stop nginx httpd apache2 2>/dev/null || true'
+            echo 'sudo fuser -k 80/tcp 2>/dev/null || true'
             echo 'cd ~/app'
             echo 'docker compose pull'
             echo 'docker compose down --remove-orphans'
