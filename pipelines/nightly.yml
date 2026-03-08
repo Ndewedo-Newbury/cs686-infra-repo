@@ -1,0 +1,193 @@
+name: Nightly Build
+
+on:
+  schedule:
+    - cron: '0 2 * * *'   # 2 AM UTC every night
+  workflow_dispatch:        # allow manual runs
+
+jobs:
+  nightly:
+    runs-on: ubuntu-latest
+
+    steps:
+
+      # ---------------------------------------------------------------
+      # Checkout & AWS auth
+      # ---------------------------------------------------------------
+
+      - name: Checkout infra repo
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+
+      # ---------------------------------------------------------------
+      # Step 1 — Launch temporary EC2 instance
+      # ---------------------------------------------------------------
+
+      - name: Get GitHub Actions runner public IP
+        id: runner-ip
+        run: echo "ip=$(curl -s https://api.ipify.org)" >> "$GITHUB_OUTPUT"
+
+      - name: Open SSH in security group for runner
+        run: |
+          aws ec2 authorize-security-group-ingress \
+            --group-id "${{ secrets.EC2_SG_ID }}" \
+            --protocol tcp \
+            --port 22 \
+            --cidr "${{ steps.runner-ip.outputs.ip }}/32" || true
+
+      - name: Write SSH private key to disk
+        run: |
+          echo "${{ secrets.QA_EC2_SSH_KEY }}" > /tmp/ssh_key
+          chmod 600 /tmp/ssh_key
+
+      - name: Resolve latest Amazon Linux 2023 AMI
+        id: ami
+        run: |
+          AMI_ID=$(aws ec2 describe-images \
+            --owners amazon \
+            --filters "Name=name,Values=al2023-ami-2023*-kernel-*-x86_64" \
+                      "Name=state,Values=available" \
+            --query "sort_by(Images, &CreationDate)[-1].ImageId" \
+            --output text)
+          echo "id=$AMI_ID" >> "$GITHUB_OUTPUT"
+          echo "Using AMI: $AMI_ID"
+
+      - name: Launch temp EC2 instance
+        id: launch
+        run: |
+          INSTANCE_ID=$(aws ec2 run-instances \
+            --image-id            "${{ steps.ami.outputs.id }}" \
+            --instance-type       t3.small \
+            --key-name            "${{ secrets.EC2_KEY_NAME }}" \
+            --security-group-ids  "${{ secrets.EC2_SG_ID }}" \
+            --subnet-id           "${{ secrets.EC2_SUBNET_ID }}" \
+            --associate-public-ip-address \
+            --user-data           file://ec2-temp/user-data.sh \
+            --tag-specifications  'ResourceType=instance,Tags=[{Key=Name,Value=cs686-nightly-temp},{Key=ManagedBy,Value=github-actions}]' \
+            --query               'Instances[0].InstanceId' \
+            --output              text)
+
+          echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
+          echo "Launched: $INSTANCE_ID"
+
+      - name: Wait for instance to be running
+        run: |
+          aws ec2 wait instance-running \
+            --instance-ids "${{ steps.launch.outputs.instance_id }}"
+
+      - name: Get instance public IP
+        id: ec2-ip
+        run: |
+          IP=$(aws ec2 describe-instances \
+            --instance-ids "${{ steps.launch.outputs.instance_id }}" \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' \
+            --output text)
+          echo "ip=$IP" >> "$GITHUB_OUTPUT"
+          echo "Instance IP: $IP"
+
+      # ---------------------------------------------------------------
+      # Step 2 — Deploy source repo to temp instance
+      # ---------------------------------------------------------------
+
+      - name: Wait for SSH to become available
+        run: |
+          echo "Polling SSH on ${{ steps.ec2-ip.outputs.ip }}..."
+          for i in $(seq 1 30); do
+            ssh -o StrictHostKeyChecking=no \
+                -o ConnectTimeout=5 \
+                -i /tmp/ssh_key \
+                ec2-user@"${{ steps.ec2-ip.outputs.ip }}" \
+                exit 0 2>/dev/null && echo "SSH ready after attempt $i" && exit 0
+            echo "  Attempt $i/30 — not ready yet, waiting 10s..."
+            sleep 10
+          done
+          echo "ERROR: SSH never became available" && exit 1
+
+      - name: Wait for Docker to be ready on instance
+        run: |
+          for i in $(seq 1 12); do
+            ssh -o StrictHostKeyChecking=no -i /tmp/ssh_key \
+                ec2-user@"${{ steps.ec2-ip.outputs.ip }}" \
+                'docker info > /dev/null 2>&1' && echo "Docker ready" && exit 0
+            echo "  Attempt $i/12 — Docker not ready yet, waiting 10s..."
+            sleep 10
+          done
+          echo "ERROR: Docker never became ready" && exit 1
+
+      - name: Clone source repo on instance
+        run: |
+          ssh -o StrictHostKeyChecking=no -i /tmp/ssh_key \
+              ec2-user@"${{ steps.ec2-ip.outputs.ip }}" \
+              "git clone https://x-access-token:${{ secrets.GH_PAT }}@github.com/${{ secrets.SOURCE_REPO }} ~/app"
+
+      - name: Write .env file and copy to instance
+        run: |
+          # REACT_APP_API_URL uses /api since nginx on the same host
+          # proxies /api/ → backend:8080. The smoke test targets http://localhost
+          # which hits nginx on port 80, matching production behaviour.
+          cat > /tmp/app.env << EOF
+          DB_HOST=${{ secrets.DB_HOST }}
+          DB_USER=${{ secrets.DB_USER }}
+          DB_PASSWORD=${{ secrets.DB_PASSWORD }}
+          DB_NAME=${{ secrets.DB_NAME }}
+          NODE_ENV=production
+          REACT_APP_API_URL=http://${{ steps.ec2-ip.outputs.ip }}/api
+          EOF
+
+          scp -o StrictHostKeyChecking=no -i /tmp/ssh_key \
+              /tmp/app.env \
+              ec2-user@"${{ steps.ec2-ip.outputs.ip }}":~/app/.env
+
+      - name: Build and start application
+        # Building the React image takes a few minutes on t3.small — 10 min timeout
+        timeout-minutes: 15
+        run: |
+          ssh -o StrictHostKeyChecking=no -i /tmp/ssh_key \
+              ec2-user@"${{ steps.ec2-ip.outputs.ip }}" \
+              "cd ~/app && docker compose up --build -d"
+
+      # ---------------------------------------------------------------
+      # Step 3 — Smoke tests
+      # Runs on the instance itself via SSH so no extra ports need opening.
+      # The smoke-test.sh is already in the cloned repo at ~/app/smoke-test.sh.
+      # ---------------------------------------------------------------
+
+      - name: Run smoke tests on instance
+        run: |
+          ssh -o StrictHostKeyChecking=no -i /tmp/ssh_key \
+              ec2-user@"${{ steps.ec2-ip.outputs.ip }}" \
+              "bash ~/app/smoke-test.sh http://localhost"
+
+      # ---------------------------------------------------------------
+      # Cleanup — always runs, even on failure
+      # ---------------------------------------------------------------
+
+      - name: Terminate temp instance
+        if: always()
+        run: |
+          INSTANCE_ID="${{ steps.launch.outputs.instance_id }}"
+          if [ -n "$INSTANCE_ID" ]; then
+            aws ec2 terminate-instances --instance-ids "$INSTANCE_ID"
+            echo "Terminated $INSTANCE_ID"
+          else
+            echo "No instance to terminate"
+          fi
+
+      - name: Revoke SSH security group rule for runner
+        if: always()
+        run: |
+          RUNNER_IP="${{ steps.runner-ip.outputs.ip }}"
+          if [ -z "$RUNNER_IP" ]; then exit 0; fi
+          aws ec2 revoke-security-group-ingress \
+            --group-id "${{ secrets.EC2_SG_ID }}" \
+            --protocol tcp \
+            --port 22 \
+            --cidr "$RUNNER_IP/32" || true
+          echo "Security group rule revoked for $RUNNER_IP"
