@@ -47,23 +47,11 @@ jobs:
           echo "${{ secrets.QA_EC2_SSH_KEY }}" > /tmp/ssh_key
           chmod 600 /tmp/ssh_key
 
-      - name: Resolve latest Amazon Linux 2023 AMI
-        id: ami
-        run: |
-          AMI_ID=$(aws ec2 describe-images \
-            --owners amazon \
-            --filters "Name=name,Values=al2023-ami-2023*-kernel-*-x86_64" \
-                      "Name=state,Values=available" \
-            --query "sort_by(Images, &CreationDate)[-1].ImageId" \
-            --output text)
-          echo "id=$AMI_ID" >> "$GITHUB_OUTPUT"
-          echo "Using AMI: $AMI_ID"
-
       - name: Launch temp EC2 instance
         id: launch
         run: |
           INSTANCE_ID=$(aws ec2 run-instances \
-            --image-id            "${{ steps.ami.outputs.id }}" \
+            --image-id            "${{ secrets.EC2_AMI_ID }}" \
             --instance-type       t3.small \
             --key-name            "${{ secrets.EC2_KEY_NAME }}" \
             --security-group-ids  "${{ secrets.EC2_SG_ID }}" \
