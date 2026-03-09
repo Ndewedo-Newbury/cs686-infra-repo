@@ -318,7 +318,7 @@ jobs:
             echo 'cd ~/app && docker compose down --remove-orphans 2>/dev/null || true'
             echo '# Install pip and certbot with Route 53 DNS plugin'
             echo 'sudo dnf install -y python3-pip -q'
-            echo 'sudo pip3 install certbot certbot-dns-route53 -q'
+            echo 'sudo pip3 install --ignore-installed certbot certbot-dns-route53 -q'
             echo '# Obtain/renew cert using Route 53 DNS challenge (no port 80 needed)'
             echo "if [ ! -d /etc/letsencrypt/live/${QA_DOMAIN} ]; then"
             echo "  sudo -E certbot certonly --dns-route53 --non-interactive --agree-tos \\"
