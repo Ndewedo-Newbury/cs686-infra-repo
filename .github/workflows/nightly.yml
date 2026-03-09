@@ -226,6 +226,27 @@ jobs:
       # Step 5 — Deploy to QA EC2
       # ---------------------------------------------------------------
 
+      - name: Update Route 53 A record for QA domain
+        env:
+          QA_HOST: ${{ secrets.QA_EC2_HOST }}
+          ZONE_ID: ${{ secrets.ROUTE53_ZONE_ID }}
+          QA_DOMAIN: ${{ secrets.QA_DOMAIN }}
+        run: |
+          aws route53 change-resource-record-sets \
+            --hosted-zone-id "${ZONE_ID}" \
+            --change-batch "{
+              \"Changes\": [{
+                \"Action\": \"UPSERT\",
+                \"ResourceRecordSet\": {
+                  \"Name\": \"${QA_DOMAIN}\",
+                  \"Type\": \"A\",
+                  \"TTL\": 60,
+                  \"ResourceRecords\": [{\"Value\": \"${QA_HOST}\"}]
+                }
+              }]
+            }"
+          echo "DNS record updated: ${QA_DOMAIN} -> ${QA_HOST}"
+
       - name: Write QA .env and docker-compose to QA EC2
         env:
           DB_HOST: ${{ secrets.DB_HOST }}
@@ -295,14 +316,14 @@ jobs:
             echo 'sudo systemctl stop nginx httpd apache2 2>/dev/null || true'
             echo 'sudo fuser -k 80/tcp 443/tcp 2>/dev/null || true'
             echo 'cd ~/app && docker compose down --remove-orphans 2>/dev/null || true'
-            echo '# Install certbot if missing'
-            echo 'command -v certbot || sudo dnf install -y certbot'
-            echo '# Obtain cert on first run; renew quietly on subsequent runs'
+            echo '# Install certbot with Route 53 DNS plugin if missing'
+            echo 'command -v certbot || sudo pip3 install certbot certbot-dns-route53 -q'
+            echo '# Obtain/renew cert using Route 53 DNS challenge (no port 80 needed)'
             echo "if [ ! -d /etc/letsencrypt/live/${QA_DOMAIN} ]; then"
-            echo "  sudo certbot certonly --standalone --non-interactive --agree-tos \\"
+            echo "  sudo -E certbot certonly --dns-route53 --non-interactive --agree-tos \\"
             echo "    --email '${CERTBOT_EMAIL}' -d '${QA_DOMAIN}'"
             echo 'else'
-            echo '  sudo certbot renew --quiet --standalone'
+            echo '  sudo -E certbot renew --quiet'
             echo 'fi'
             echo 'cd ~/app'
             echo 'docker compose pull'
