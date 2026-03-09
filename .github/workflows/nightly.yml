@@ -212,7 +212,7 @@ jobs:
         env:
           AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
           ECR_REPO: ${{ secrets.ECR_REPO }}
-          QA_EC2_HOST: ${{ secrets.QA_EC2_HOST }}
+          QA_DOMAIN: ${{ secrets.QA_DOMAIN }}
         run: |
           DATE="$(date +%Y%m%d)"
           ECR="${AWS_ACCOUNT_ID}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com"
@@ -223,9 +223,9 @@ jobs:
           docker build --target backend -t "${BACKEND_URI}" /tmp/app-source
           docker push "${BACKEND_URI}"
 
-          # Frontend — bake in the QA host's API URL
+          # Frontend — bake in the QA domain's HTTPS API URL
           docker build --target frontend \
-            --build-arg REACT_APP_API_URL="http://${QA_EC2_HOST}/api" \
+            --build-arg REACT_APP_API_URL="https://${QA_DOMAIN}/api" \
             -t "${FRONTEND_URI}" /tmp/app-source
           docker push "${FRONTEND_URI}"
 
@@ -286,6 +286,8 @@ jobs:
           AWS_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
           AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
           QA_HOST: ${{ secrets.QA_EC2_HOST }}
+          QA_DOMAIN: ${{ secrets.QA_DOMAIN }}
+          CERTBOT_EMAIL: ${{ secrets.CERTBOT_EMAIL }}
         run: |
           ECR="${AWS_ACCOUNT_ID}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com"
 
@@ -298,12 +300,21 @@ jobs:
             echo "export AWS_SESSION_TOKEN='${AWS_TOKEN}'"
             echo "aws ecr get-login-password --region '${{ secrets.AWS_REGION }}' | \\"
             echo "  docker login --username AWS --password-stdin '${ECR}'"
-            echo '# Stop any OS-level service holding port 80'
+            echo '# Stop any OS-level service holding port 80 or 443'
             echo 'sudo systemctl stop nginx httpd apache2 2>/dev/null || true'
-            echo 'sudo fuser -k 80/tcp 2>/dev/null || true'
+            echo 'sudo fuser -k 80/tcp 443/tcp 2>/dev/null || true'
+            echo 'cd ~/app && docker compose down --remove-orphans 2>/dev/null || true'
+            echo '# Install certbot if missing'
+            echo 'command -v certbot || sudo dnf install -y certbot'
+            echo '# Obtain cert on first run; renew quietly on subsequent runs'
+            echo "if [ ! -d /etc/letsencrypt/live/${QA_DOMAIN} ]; then"
+            echo "  sudo certbot certonly --standalone --non-interactive --agree-tos \\"
+            echo "    --email '${CERTBOT_EMAIL}' -d '${QA_DOMAIN}'"
+            echo 'else'
+            echo '  sudo certbot renew --quiet --standalone'
+            echo 'fi'
             echo 'cd ~/app'
             echo 'docker compose pull'
-            echo 'docker compose down --remove-orphans'
             echo 'docker compose up -d'
             echo 'rm -- "$0"'
           } > /tmp/qa-deploy.sh
@@ -316,11 +327,11 @@ jobs:
 
       - name: QA health check
         run: |
-          echo "Polling QA at ${{ secrets.QA_EC2_HOST }}..."
+          echo "Polling QA at ${{ secrets.QA_DOMAIN }}..."
           for i in $(seq 1 12); do
             CODE=$(ssh -o StrictHostKeyChecking=no -i /tmp/ssh_key \
                 ec2-user@"${{ secrets.QA_EC2_HOST }}" \
-                "curl -s -o /dev/null -w '%{http_code}' http://localhost/api/getArticles" 2>/dev/null)
+                "curl -sk -o /dev/null -w '%{http_code}' https://localhost/api/getArticles" 2>/dev/null)
             echo "  Attempt $i/12 — HTTP $CODE"
             [ "$CODE" = "200" ] && echo "QA is healthy" && exit 0
             sleep 10
